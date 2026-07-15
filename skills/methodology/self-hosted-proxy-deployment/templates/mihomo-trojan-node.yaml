@@ -1,0 +1,9 @@
+  - name: "trojan-tls"
+    type: trojan
+    server: <OVERSEAS_IP>
+    port: 8443
+    password: "<SAME-AS-SERVER>"
+    network: tcp
+    udp: true
+    sni: <OVERSEAS_IP-or-domain>
+    skip-cert-verify: true

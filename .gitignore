@@ -1,0 +1,113 @@
+message_tags.db
+vdb/chroma/
+vdb/.venv/
+.env
+state.db
+response_store.db
+verification_evidence.db
+memory_store.db
+*.db
+hermes-agent/
+# 运行时/敏感文件 (补遗, 不入库)
+.env.bak*
+auth.json
+auth.lock
+.hermes_history
+.update_check
+__pycache__/
+*.pyc
+bin/
+analysis/
+acp_delegation_analysis.md
+*.log
+state-snapshots/
+# Hermes 运行时产物 (全部排除, 仅保留 scripts/ skills/ SOUL.md 源码)
+config.yaml
+config.yaml.bak.*
+*.bak.*
+*.lock
+*.pid
+*.shm
+*.wal
+cache/
+logs/
+cron/
+pastes/
+lsp/
+node/
+models_dev_cache.json
+ollama_cloud_models_cache.json
+channel_directory.json
+feishu_seen_message_ids.json
+gateway.lock
+gateway.pid
+gateway_state.json
+hcp.token
+kanban/
+browser_recordings/
+mcp.json
+completion_ack.py
+hcp_client.py
+hcp_protocol.md
+hcp_server.py
+*.db-shm
+*.db-wal
+# 其余运行时/会话/缓存
+plans/
+sessions/
+processes.json
+provider_models_cache.json
+ta<api-key>/
+ta<api-key>.schema.yaml
+test_hcp_integration.py
+test_p0_timeout.py
+watchdog.py
+# 临时文档/工作区
+workspace/
+
+# vdb 私有引擎: 白名单跟踪源码+关键元数据, 忽略运行时
+vdb/
+!vdb/
+!vdb/*.py
+!vdb/eval/
+!vdb/eval/*.py
+!vdb/idf_map.json
+!vdb/vdb_state.json
+vdb/chroma/
+vdb/.venv/
+vdb/__pycache__/
+vdb/.archive/
+vdb/eval/*.json
+vdb/eval/cases/
+vdb/eval/prompts/
+vdb/eval/results/
+
+# skill 运行时使用统计 (vdb 自动维护)
+skills/.usage.json
+skills/.curator_state
+skills/.curator_backups/
+.skills_prompt_snapshot.json
+
+# skill examples 中的 office 二进制 (由同目录 .sh 脚本可重新生成, 不入库)
+skills/**/examples/**/*.pptx
+skills/**/examples/**/*.xlsx
+skills/**/examples/**/*.docx
+
+# 运行时状态/备份 (机器本地, 含绝对路径, 不入库)
+*.bak-*
+scripts/message_tags.db*
+memories/compressed/
+shell-hooks-allowlist.json
+
+
+# memories/ 框架认知资产: 白名单跟踪核心文件, 忽略锁/备份
+!memories/
+!memories/FRAMEWORK_EVOLUTION.md
+!memories/MEMORY.md
+!memories/USER.md
+*memories/*.lock
+*memories/*.bak.*
+
+# graphify 运行时产物（图/缓存/HTML）
+graphify-out/
+*/graphify-out/
