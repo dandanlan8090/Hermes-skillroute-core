@@ -34,7 +34,7 @@ hermes-skillroute-core/
 │   ├── sparse.py              # 词法权重（纯 Python）
 │   ├── embed.py               # 云端嵌入（BGE-M3）
 │   ├── indexer.py             # Chroma 索引构建
-│   ├── matcher.py             # RRF(K=60) + trigger 加成混合检索
+│   ├── matcher.py             # dcg-inspired 三层: query 分类短路 → 白名单直达 → RRF(K=60) + trigger 加成
 │   ├── routing.py             # 专名门禁路由层
 │   └── __init__.py
 │
@@ -110,4 +110,4 @@ cd ~/.hermes/vdb
 python -c "from matcher import search; print(search('飞书文档', top_k=5))"
 ```
 
-混合检索 = BM25 稀疏 + BGE-M3 稠密 + trigger 加成（RRF K=60）。
+检索流程 = query 分类短路(问候/空query) → 白名单直达(精确命中技能名/trigger) → 稠密(BGE-M3) → 稀疏(BM25) → disable过滤 → RRF K=60 + trigger加成 → 路由门禁。详见 `vdb/matcher.py` 顶部 docstring。
