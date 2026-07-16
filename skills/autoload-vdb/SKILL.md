@@ -1,7 +1,7 @@
 ---
 name: autoload-vdb
 description: "Hermes 启动时自动加载 vdb 技能语义匹配（Chroma + SiliconFlow BGE-M3 云端稠密 prose 模板 + 本地 sparse lexical，leading word 2x boost → RRF 融合 RRF_K=60 + trigger 命中 +0.010 加法加成）。触发：Hermes 初始化/启动/新 session/重新加载技能。禁用：离线环境/无 API Key/不需要语义匹配。"
-version: 6.0.0
+version: 6.1.0
 author: Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -45,7 +45,7 @@ prerequisites:
 
 vdb 是 Hermes 的**技能语义匹配系统**。给定用户 query，从 `~/.hermes/skills/` 中找出最相关的技能。
 
-**当前架构（v6.0.0）**：Chroma 持久化向量库 + SiliconFlow BGE-M3 云端稠密 + 本地 sparse lexical + leading word 2x boost。2026-07-10 改进：
+**当前架构（v6.1.0 — dcg-inspired）**：Chroma 持久化向量库 + SiliconFlow BGE-M3 云端稠密 + 本地 sparse lexical + leading word 2x boost。2026-07-16 新增三层 dcg 借鉴补丁（query 分类短路 + 白名单直达 + route_stage 标记）。2026-07-10 改进：
 - DOC 模板从字段堆叠改成 prose 自然语言段（name+leading+desc+branches）
 - 稀疏端加 leading word 2x boost（21 词池）
 - query 模板从"用户需求：{}"改成"调用{query}。"（仅 <15 字短查询包装）
@@ -60,25 +60,36 @@ from matcher import search
 results = search("部署 flask")  # 混合检索
 ```
 
-## 混合检索流水线（v6.0.0）
+## 混合检索流水线（v6.1.0 — dcg-inspired）
 
 ```
 query
   │
-  ├── 云端 SiliconFlow BAAI/bge-m3 (1024d)
+  ├── 0. (A) dcg query 分类短路
+  │     问候/短词不在映射表 → 直接返回 []，省 BGE-M3 API
+  │     fast_path：全量精确命中技能名/trigger → 直达，跳过 RRF
+  │
+  ├── 1. 云端 SiliconFlow BAAI/bge-m3 (1024d)
   │     输入: PROSE_DOC_TEMPLATE = "{name}：{leading}。{desc}。触发：{branches}。"
   │     QUERY 端: 短查询(<15字)用 "调用{query}。" 包装，长查询裸送
   │     Chroma cosine 召回 top-16
   │
-  ├── 本地 sparse.py (纯 Python, 无需 torch/FlagEmbedding)
+  ├── 2. 本地 sparse.py (纯 Python, 无需 torch/FlagEmbedding)
   │     输入: trigger_tags + description 中文短语(>=2字) 合并，TF-IDF 加权
-  │     leading word 命中 2x boost（池 21 词：fog-of-war/verify-first/root-cause 等）
+  │     leading word 命中 2x boost（池 21 词）
   │     算法: tokenize(中文按字+英文按词) → log(1+tf)×idf → 余弦归一化
   │     英文 description 完全隔离
   │
-  └── RRF 融合 (RRF_K=60): final = 1/(60+dense_rank) + 1/(60+sparse_rank)
-       → trigger 命中 +0.010 加法加成 → disable 过滤 → top-5
+  └── 3. disable 过滤 → RRF 融合 (RRF_K=60)
+       → trigger 命中 +0.010 加法加成
+       → (C) route_stage 标记：fast_path / rrf
+       → 路由门禁过滤 → top-5
 ```
+
+Feature flags（matcher.py 顶部开关，False 即回滚）：
+- `USE_QUERY_CLASSIFICATION` — 借鉴A：query 分类短路（对标 dcg SpanKind）
+- `USE_FAST_PATH`           — 借鉴B：白名单直达（对标 dcg SAFE_PATTERNS）
+- `USE_ROUTE_ANNOTATION`    — 借鉴C：路由阶段标记（对标 dcg confidence 只降级不前置加权）
 
 ## 文件结构
 
@@ -193,7 +204,49 @@ TRIG_HIT_BONUS = 0.010   # trigger 命中加法加成（见下方坑位 1/2）
 
 > 完整演化线与负结果记录见 `references/benchmark-evolution-2026-07-11.md`（本次新增）。
 
-### 6. 方法论改进原则
+### 6. dcg-inspired 三层补丁（2026-07-16）
+
+借鉴 dcg（Destructive Command Guard）的分类路由方法，在 RRF 融合前新增两层短路，对标 dcg 的 SpanKind 状态机 + SAFE_PATTERNS 白名单。
+
+#### 借鉴A：query 分类短路（_classify_query）
+matcher.py 入口处先判断 query 类型。问候/短词不在 _TRIGGER_MAPPING → 直接返回 []，省一次 BGE-M3 云端 API 调用。
+- 规则1：完整 query 精确命中映射表 → retrieval
+- 规则2：问候/元指令模式 → non_retrieval
+- 规则3：单 token 且是短词（中≤2 或英数≤4）且不在映射表 → non_retrieval；长短语（如"帮我写脚本"长度 5）→ retrieval
+- 规则4：多 token / 复杂 → retrieval（fail-open）
+- PITFALL：中文无空格，整句可能被合并为一个 token。必须按长度区分短词（闲聊）和长短语（可能是查询意图），不能仅凭 len(meaningful)==1 就短路。
+
+#### 借鉴B：白名单直达（_fast_path）
+dense 召回后、RRF 前，精确命中技能名/trigger 时跳过 RRF 直达返回。对应 dcg SAFE_PATTERNS 白名单短路。
+- 策略：完整 query 精确命中技能名/trigger → 直达；独立有意义词命中 trigger → 直达
+- _TRIGGER_MAPPING 从 Chroma 全量元数据构建（模块预热时自动加载、技能变更后 refresh_trigger_mapping() 刷新）
+- PITFALL：映射表只包含 skill_name + trigger_tags，不含 description 自动提取的中文短语——避免扩大化误触发。
+
+#### 借鉴C：路由阶段标记（route_stage）
+返回结果带 route_stage 字段（fast_path / rrf），零逻辑变更仅观测增强。对应 dcg confidence 只用于后处理降级、不前置加权。
+
+#### Feature Flags（matcher.py 顶部）
+```python
+USE_QUERY_CLASSIFICATION = True   # 借鉴A
+USE_FAST_PATH = True              # 借鉴B
+USE_ROUTE_ANNOTATION = True       # 借鉴C
+```
+设 False 即回滚对应功能，不改其他代码。灰度顺序：先 C（零风险）→ A（低风险）→ B（中风险），每步观察 1-2 天。
+
+#### 与 dcg 的关键对比
+
+| 维度 | dcg | vdb |
+|------|-----|-----|
+| 路由时机 | 命令匹配前：字节级 SpanKind 状态机 | 嵌入检索前：轻量 query 分类 |
+| 分层依据 | 命令语法上下文 | query 语义/token 查表 |
+| 融合方式 | 白名单短路 + 黑名单（确定性） | RRF(K=60) 融合 |
+| 失败策略 | fail-safe 偏严（宁可误拦） | fail-open 偏召回（拿不准就走检索） |
+| 分数用途 | 决策后置信度降级（Critical 保护） | trigger +0.010 加法后处理 |
+| 实时接入 | 同进程 PreToolUse hook | vdb-autoload process_context 钩子 |
+
+> 核心启示：机制层必须 == 实时层。dcg 的 SpanKind 分类直接写在 PreToolUse 实时路径上（hook.rs→evaluator.rs→context.rs），无 side table 异步消费。vdb 的 process_context 钩子是正确形态（实时路径内做分类/路由），不要学只写 message_tags.db 等离线消费的架构。
+
+### 7. 方法论改进原则
 
 当引入外部方法论（如 dzhng/skills）优化现有系统时，遵守"做改进不做新技能"原则：
 - **先比对**：识别外部方法论中高于现有体系的部分
