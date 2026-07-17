@@ -232,6 +232,10 @@ Hermes 的技能检索是 **dense(BGE-M3 1024d) + sparse(IDF 增强) RRF 融合*
 4. **创建/修改后必须重建索引**：`build_index` 扫描 `skills/` 全量重编。新技能/新 trigger 不重建 = 检索不到。
    - 开发期：`cd ~/.hermes/vdb && source .venv/bin/activate && python3 -c "from indexer import build_index; build_index(force=True)"`
    - 安装/开机：`python3 ~/.hermes/scripts/vdb-autoload.py --auto`（哈希检测 skills 列表，过期自动重建）
+5. **删除/归档/恢复后也必须重建索引（强约束，2026-07-17 实测教训）**：`check_index_stale()` 能识别新增**与删除**，只靠 `build_index(force=True)` 全量重建才能同步双方。只删本地技能文件、不重建 = Chroma 里遗留**幽灵记录**（已删技能仍在召回集，且新增技能不进索引）。`is_healthy()` 只检测数据库可访问，**不检测 staleness**——健康的库也可能是过期的库。
+   - 触发场景：删技能、移入 `.archive/`、从 `.archive/` 恢复、软链技能增删。
+   - 统一动作：`python3 ~/.hermes/scripts/vdb-autoload.py --check` 先确认 stale 原因，再 `build_index(force=True)` 全量重建，最后 `--check` 复验 `stale=False`。
+   - ⚠ 自动 staleness 检查**未接入实时路径**：当前只有手动 `vdb-autoload.py --auto/--check` 会调 `check_index_stale()`，无 hook/cron 自动触发。因此任何技能增删后**必须人工跑一次重建**，不能假设“框架会自动更新”。
 5. **边界认知（勿死磕元数据）**：dense embedding 足够强时，sparse/trigger/disable 的边际贡献趋零。若某 query 总被 dense 语义偏差抢走（如"同步配置"→source-driven、"changelog"→git-worktree），这是 BGE-M3 的天花板，不是元数据能解——除非换 embedding 模型或做 dense 侧 domain fine-tune。不要在元数据层面反复调参。
 
 > 📌 完整写法规范 + 边界 case 表 + 自检清单：见 `autoload-vdb/references/METADATA_GUIDE.md`（本段是其流程钩子，该文件是规范源）。

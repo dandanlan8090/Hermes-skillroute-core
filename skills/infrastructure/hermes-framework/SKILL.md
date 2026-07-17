@@ -207,6 +207,7 @@ SOUL.md §技能路由表、各独立 skill、系统 prompt 内置的 "Before re
 |------|------|----------|
 | vdb 返回空 / is_healthy()==False | chromadb 损坏 / .venv 丢失 / API key 无效 | `~/.hermes/scripts/init-vdb.sh` 重装 |
 | vdb 返回旧技能 | 新增/修改后未 rebuild | `build_index(force=True)` |
+| **vdb 召回含已删除技能（幽灵记录）/ 新技能不在索引** | **增删/归档/恢复技能后只改了本地文件、没重建索引**；`check_index_stale()` 能识别新增+删除，但**无自动触发**（仅手动 `vdb-autoload.py --auto/--check` 调用），`is_healthy()` **只测可访问不测 staleness**——健康库也可能是过期库 | 任何技能**新增/删除/归档/恢复**后必须 `python3 ~/.hermes/scripts/vdb-autoload.py --check` 确认 stale 原因，再 `build_index(force=True)` 全量重建，最后 `--check` 复验 `stale=False`。强制规则与触发场景见 `hermes-agent-skill-authoring` §召回质量约束 #4/#5 |
 | skill_view 失败 | frontmatter 损坏 / 文件误删 | `ls ~/.hermes/skills/`；`skill_manage(action='create')` 重建 |
 | recall top-5 全无关 | trigger 标签太少/脱离用户用语 | 补 trigger 后 rebuild |
 | **业务 query 误命中重型框架文档（如"重构函数"→hermes-framework 瞬间注入 7K）** | 中文 sparse 单字切分 + dense 语义歧义；disable/摘词/前缀过滤都无效 | 用 vdb/routing.py **专名门禁**（静态或 frontmatter 声明式 gate）；设计+踩坑+验证清单见 `references/routing-gate-layer.md` |
