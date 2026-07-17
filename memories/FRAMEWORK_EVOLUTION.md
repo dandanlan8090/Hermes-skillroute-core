@@ -150,3 +150,16 @@
 - 方法论价值（隐性知识显式化）：本次本质是「代码-文档漂移」类问题的典型案例——**代码改了，但描述它的 skill 因无强制同步清单 + 被 pin 绕过 review 而长期失真**。纠正不是补一次文档，而是把「vdb 代码改动 → 同步两描述型 skill → pin 走解 pin 流程」沉淀为 hermes-framework §6 的强制检查项。框架演进中这类「隐性纪律」应主动显式化、流程化，避免同样问题在另一个被 pin 的 skill 上重演。
 - 边界认知：skills/ 内的历史实证数字（code-simplification 的「58 技能 FAISS 过度工程」演进叙事、autoload-vdb 的 2026-07-09 benchmark 数据）是当时真实快照，属封存证据，**不改**——改了反而破坏叙事真实性。
 - 决策人：@lan（拍板保留 trigger 词、确认同步清单+pin 指引写入、强烈建议记入本文件）/ Hermes（诊断 + 修正 + 验证 + 沉淀）
+
+## [2026-07-17] docs+chore: hermes-routing-table-index-proposal 失效标记与残留清理
+- 类型：docs（标记失效）+ chore（清理死配置/死 cron）
+- 原因：`skills_index_mode`（names-only/routing-only 索引模式）提案于 2026-07-14 落地，但消费逻辑 patch 进了核心文件 `agent/system_prompt.py` + `agent/prompt_builder.py`；2026-07-17 的 `hermes update` 还原了核心文件 → 消费逻辑丢失 → `config.yaml` 的 `agent.skills_index_mode: names-only` 成**死配置**（全代码树 grep=0 命中，无任何代码读取）。残留的 names-only 渲染分支实为 `agent.coding_context: focus` 原生功能（同名不同源）。每天 update 还原，维护补丁纯吃力不讨好，故放弃路径 A（install.sh 后置补丁自愈），走路径 B（focus 官方开关，持久、实测 -3.5% 体积）。
+- 变更内容（全在 ~/.hermes 边界内，已验证）：
+  - `hermes-routing-table-index-proposal/SKILL.md`：顶部插入失效标记块；§7「已落地」→[2026-07-17 失效]；§8 Phase 1/2「已完成/已启用」→[2026-07-17 失效]；cron 周巡检段标注「已注销 2026-07-17」；新增 `references/names_only_deadconfig.md` 诊断文档。
+  - `config.yaml`：`hermes config unset agent.skills_index_mode`（删死配置）；`agent.coding_context: focus` 保留生效。
+  - cron：`hermes cron remove ece8c80f7016`（index_mode_vdb_health_monitor，停每周基于死配置的死状态报告）。
+  - `scripts/index_mode_monitor.sh`：改写说明，剥离 index_mode 语境，重定位为**通用 vdb 检索健康看门狗**（逻辑保留，可重新 `hermes cron create` 复用）。
+  - `memories/MEMORY.md`：删除该议题临时诊断记录（已彻底清理，详情见 skill 失效复盘段）。
+- 验证（真实）：`grep skills_index_mode` 全代码树=0；config 死配置已删；cron 已注销；focus 区块实测 17480→16865 bytes（-3.5%）；`build_skills_system_prompt()` 签名无 index_mode 参数。
+- 边界认知：本提案"路由命中后动态补全"的设计理念可取（对铁律#0 的合规增强），但实现选了 patch 核心文件违反了框架修改铁律①（不深入核心、避免更新失效），是被 update 还原的根因。未来若重做，应走 ~/.hermes 边界内钩子/独立 wrapper，不碰 agent/ 核心。
+- 决策人：@lan / Hermes
