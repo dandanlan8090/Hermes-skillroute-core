@@ -163,3 +163,20 @@
 - 验证（真实）：`grep skills_index_mode` 全代码树=0；config 死配置已删；cron 已注销；focus 区块实测 17480→16865 bytes（-3.5%）；`build_skills_system_prompt()` 签名无 index_mode 参数。
 - 边界认知：本提案"路由命中后动态补全"的设计理念可取（对铁律#0 的合规增强），但实现选了 patch 核心文件违反了框架修改铁律①（不深入核心、避免更新失效），是被 update 还原的根因。未来若重做，应走 ~/.hermes 边界内钩子/独立 wrapper，不碰 agent/ 核心。
 - 决策人：@lan / Hermes
+
+## [2026-07-18] feat: vdb 架构迁移 + SwarmVault 知识库集成 + 降级检索链路
+- 类型：feat（架构迁移 + 外部知识库接入）+ docs（README/演进记录）
+- 原因：vdb 技能库从 `~/.hermes/skills/` 迁到 `~/knowledge/skills/`（软链 + 两级目录），主检索路径改为 `vdb.search() → skill_path → read_file`（非 skill_view）；同时引入 SwarmVault 作为领域知识层，与 vdb 形成「路由 vs 知识」双层分离，并用 `hermes-hybrid-retrieval` 技能封装 vdb miss 时的 vault 兜底。
+- 变更内容（全在 ~/.hermes 边界内，已验证）：
+  - `vdb/indexer.py`：改用 `os.walk(followlinks=True)` 覆盖软链技能库（修复 27 个 lark-* 技能漏召，索引 99→110）；TOP_K_CANDIDATES 16→32、DEFAULT_TOP_K 5→8（大库降长尾漏召）。
+  - `vdb/matcher.py`：新增 `_SKILL_PATH_BY_NAME` 缓存，fast_path 命中后支持 `read_file(skill_path)` 闭环（原实现只填 name/score 断链）。
+  - `skills/methodology/hermes-hybrid-retrieval`：新增降级检索技能（vdb 空或 final_score<0.015 → query_vault，3s 超时，不进实时主路径）。
+  - `scripts/swarmvault-compile.sh`：新增 SwarmVault 定期编译脚本（source ~/.hermes/.env 取 key → swarmvault compile --commit），由 cron 每周日 03:00 调用。
+  - swarmvault.config.json：`compileProvider=agnes`（agnes-2.0-flash，chat 提取）、`embeddingProvider=siliconflow`（BAAI/bge-m3，与 vdb 同源 key）。
+  - raw/sources/：4 个知识素材（代理拓扑 / MCP 架构 / 框架铁律 / 飞书生态）经 ingest → compile 生成 32 节点 / 37 边 / 4 社区图谱。
+- 验证（真实）：`hermes mcp test swarmvault` 通过（51 工具）；vdb build_index 110 技能 healthy；graph_stats=32 nodes/37 edges；query_vault 跨 3 source 聚合正确；cron 87a4126b5c4e 注册成功 next_run 2026-07-19T03:00；编译脚本手动跑通 exit 0。
+- 关键纠偏（隐性知识显式化）：
+  - **SiliconFlow key 误判**：曾在 skill 文档断言 key 401 失效；根因是终端手敲 key 被截断/脱敏遮挡，vdb 同款 `load_dotenv()` 从 `.env` 取真实 key 实测 embeddings dim=1024 正常。结论：配置 swarmvault 必须走 env 加载，不手敲 key；vdb 用同一 key 未失效。已修 `integration/swarmvault-knowledge-base/references/provider-config.md`。
+  - **路径纠正**：曾误把架构事实写 inbox/ 再 ingest（指出 inbox 是中间层会引入 LLM 翻译损耗），正确路径是 raw/ → ingest → compile → wiki/（wiki/ 是编译产物非输入）。
+- 边界认知：SwarmVault 的 raw/wiki/state 是个人隐私知识资产，不入本仓库；仓库只收技能定义与编译脚本。降级链路保持「显式触发」不自动挂铁律#0，按「先实验观察触发率」建议。
+- 决策人：@lan（纠正路径/key 误判，拍板双层分离架构）/ Hermes（执行 + 验证 + 沉淀）

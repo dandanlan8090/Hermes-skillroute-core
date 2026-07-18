@@ -2,22 +2,31 @@
 索引构建 — Chroma 入库。
 
 流程:
-  1. 遍历 skills/ 解析 frontmatter
+  1. 遍历 skills/ 解析 frontmatter（yaml.safe_load，修复 RISK-2 脆弱正则）
   2. PROSE_DOC_TEMPLATE 拼接 name+leading+desc+branches → 云端 BGE-M3 稠密向量
   3. trigger_tags → 本地 sparse weights（隔离英文 description，leading word 2x boost）
   4. P2: 全局 IDF 计算，weight = log(1+tf) × idf(t)
   5. 写入 Chroma 集合（向量 + metadata 含 tag_sparse）
+  6. (v3 RISK-1) build_index 后自动刷新 matcher 的 trigger mapping
 
 v2.1 (2026-07-10) 改进点:
   - DOC_TEMPLATE 改成 prose 模板：name：{leading}。{desc}。触发：{branches}。
   - 自动从 description 提取 leading word（首段第一动词短语）
   - 触发条件从 description 抽"Use when X"和"触发：X"段落
   - 模板改动 → 必须 force=True 重建索引
+v3 (2026-07-18) 改进点:
+  - RISK-2: _parse_skill_md 改用 yaml.safe_load（替代脆弱正则解析 frontmatter）
+  - RISK-1: build_index() 末尾自动 refresh trigger mapping
+  - SKILLS_DIR 默认迁移到 ~/knowledge/skills（技能即知识架构）
 """
 
 import os, re, hashlib, json, math
+import logging
 from pathlib import Path
 
+logger = logging.getLogger(__name__)
+
+import yaml
 import chromadb
 from chromadb.config import Settings
 
@@ -39,12 +48,21 @@ def _get_hermes_home() -> Path:
 
 
 HERMES_HOME = _get_hermes_home()
-SKILLS_DIR = Path(os.environ.get("HERMES_SKILL_DIR", str(HERMES_HOME / "skills")))
+# v3 (2026-07-18): 技能即知识架构 — 技能库从框架自带的 ~/.hermes/skills
+# 迁移到独立的 ~/knowledge/skills（作为可检索的知识文档层）。
+# ~/.hermes/skills 仅保留 hermes-skill-router 一个铁律指向 prompt，
+# 使 available_skills 注入归零；真实技能内容由 vdb 索引 ~/knowledge/skills，
+# 会话内经 vdb.search() 命中 skill_path 后用 read_file 按需读取。
+# 仍支持 HERMES_SKILL_DIR 环境变量覆盖（必须在 import 前设置才生效）。
+_KNOWLEDGE_SKILLS_DEFAULT = Path.home() / "knowledge" / "skills"
+SKILLS_DIR = Path(os.environ.get("HERMES_SKILL_DIR", str(_KNOWLEDGE_SKILLS_DEFAULT)))
 VDB_DIR = Path.home() / ".hermes" / "vdb"
 CHROMA_DIR = VDB_DIR / "chroma"
 
 COLLECTION_NAME = "skills"
-TOP_K_CANDIDATES = 16
+# v3 (2026-07-18): 大库（100+ 技能）下稠密召回候选数从 16 提到 32，
+# 给 RRF 融合更多分母，降低长尾技能漏召。
+TOP_K_CANDIDATES = 32
 
 # v2.1 prose 模板: name+leading_word+desc+branches 一段自然语言
 # 优势: BGE-M3 拿到的是"技能做什么+何时触发"完整语义，不是字段堆叠
@@ -288,6 +306,31 @@ def build_index(force: bool = False):
     idf_path.write_text(json.dumps(idf_map, ensure_ascii=False), encoding="utf-8")
     print(f"[indexer] 状态文件已保存: {state_path}")
     print(f"[indexer] IDF 映射已保存: {idf_path} ({len(idf_map)} tokens)")
+
+    # ── RISK-1 修复：build_index 后自动刷新 matcher 的 trigger mapping ──
+    # 索引重建后，matcher._TRIGGER_MAPPING 和 _SKILL_PATH_BY_NAME 必须同步刷新，
+    # 否则 fast_path 仍使用旧映射（技能增删改后 fast_path 命中错误/漏召）。
+    # 延迟导入避免循环依赖（matcher 已导入 indexer 的常量）。
+    # force=True 时 Chroma 先删旧 collection，新 collection 可能短暂不可用，
+    # 加小幅重试等待 PersistendClient 完成落盘。
+    try:
+        import time as _time
+        import matcher as _matcher_mod
+        _refresh_ok = False
+        for _attempt in range(5):
+            try:
+                _matcher_mod.refresh_trigger_mapping()
+                _refresh_ok = True
+                break
+            except Exception:
+                _time.sleep(0.3)
+        if _refresh_ok:
+            logger.info("build_index: trigger mapping refreshed after index rebuild")
+        else:
+            logger.warning("build_index: trigger mapping refresh skipped (collection not ready)")
+    except Exception as exc:
+        logger.warning("build_index: failed to refresh trigger mapping: %s", exc)
+        # 不阻断构建流程，最坏情况 fast_path 在当前会话用旧映射
 
 
 # ── 状态文件（健康检查） ─────────────────────────────────────────────

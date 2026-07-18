@@ -31,16 +31,17 @@ hermes-skillroute-core/
 │   └── FRAMEWORK_EVOLUTION.md # 框架演进钩子
 │
 ├── vdb/                       # 技能检索工具链
-│   ├── sparse.py              # 词法权重（纯 Python）
-│   ├── embed.py               # 云端嵌入（BGE-M3）
-│   ├── indexer.py             # Chroma 索引构建
-│   ├── matcher.py             # dcg-inspired 三层: query 分类短路 → 白名单直达 → RRF(K=60) + trigger 加成
-│   ├── routing.py             # 专名门禁路由层
+│   ├── sparse.py              # 词法权重（纯 Python，IDF 增强）
+│   ├── embed.py               # 云端嵌入（SiliconFlow BGE-M3, 1024d）
+│   ├── indexer.py            # Chroma 索引构建（v3: os.walk followlinks 覆盖软链技能库）
+│   ├── matcher.py            # dcg-inspired 三层: query 分类短路 → 白名单直达 → RRF(K=60) + trigger 加成
+│   ├── routing.py            # 专名门禁路由层
 │   └── __init__.py
 │
 ├── scripts/
 │   ├── init-vdb.sh            # .venv + pip + build_index
-│   └── vdb-autoload.py      # 预热 + 索引过期检测 + 自动重建
+│   ├── vdb-autoload.py      # 预热 + 索引过期检测 + 自动重建
+│   └── swarmvault-compile.sh # SwarmVault 知识图谱定期编译（cron 调用）
 │
 └── skills/                    # 元数据资产（全量同步本地真实结构）
     ├── core/                  # 铁律细则
@@ -111,3 +112,24 @@ python -c "from matcher import search; print(search('飞书文档', top_k=5))"
 ```
 
 检索流程 = query 分类短路(问候/空query) → 白名单直达(精确命中技能名/trigger) → 稠密(BGE-M3) → 稀疏(BM25) → disable过滤 → RRF K=60 + trigger加成 → 路由门禁。详见 `vdb/matcher.py` 顶部 docstring。
+
+## 知识库集成（SwarmVault）
+
+vdb 负责「技能路由」（怎么做），SwarmVault 负责「领域知识」（做什么用）。两层分离：
+
+- **vdb（实时主路径）**：铁律#0 每轮触发，fast_path 命中即执行 `read_file(skill_path)`，不进 LLM 主路径。
+- **SwarmVault（按需检索）**：接入 Hermes MCP（`hermes mcp add swarmvault`），存架构事实/集成约定/调研结论，按 `raw/ → ingest → compile` 构建图谱。
+- **降级链路**（`skills/methodology/hermes-hybrid-retrieval`）：vdb 返回空或 `final_score < 0.015` 时，调用 `query_vault` 兜底，3s 超时保护，不污染实时路径。
+
+配置要点（swarmvault.config.json）：
+
+```json
+{
+  "tasks": { "compileProvider": "agnes" },          // LLM 提取（agnes-2.0-flash）
+  "retrieval": { "embeddingProvider": "siliconflow" } // BGE-M3 嵌入（与 vdb 同源 key）
+}
+```
+
+图谱维护：`scripts/swarmvault-compile.sh` 由 cron 每周日 03:00 调用（先 source `~/.hermes/.env` 取 key，再 `swarmvault compile --commit`）。新增 `raw/sources/*.md` 后下次 cron 自动入图，或手动跑脚本即时生效。
+
+> ⚠️ SwarmVault 的 raw/wiki/state 运行时数据不入本仓库（属个人知识资产），仓库只收 `swarmvault-compile.sh` 与 `hermes-hybrid-retrieval` 技能定义。

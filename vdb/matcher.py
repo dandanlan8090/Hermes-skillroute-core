@@ -47,6 +47,15 @@ SPARSE_WEIGHT = 0.4
 # RRF 融合参数
 RRF_K = 60
 
+# v3 (2026-07-18): 技能即知识架构 — 技能库迁到 ~/knowledge/skills 后
+# 技能量可能很大（100+）。为在大库下保持召回质量：
+#   TOP_K_CANDIDATES: Chroma 稠密召回候选数，从 16 提到 32，
+#     给 RRF 更多分母、降低长尾技能漏召（大库下 dense top-16 易截断相关项）。
+#   DEFAULT_TOP_K: search() 默认返回数，从 5 提到 8，
+#     让调用方（read_file 闭环）有更多候选可挑，减少误判。
+# 这两个值可通过 search(top_k=N) 逐次覆盖，不影响默认行为。
+DEFAULT_TOP_K = 8
+
 # v2.1: prose 对齐 query 模板。DOC 侧是 "{name}：{leading}。{desc}。触发：{branches}。"
 # QUERY 侧用 "{query}" 动词对齐。短查询(<10字)才包装，长查询保留裸 query
 QUERY_TEMPLATE_PROSE = "调用{query}。"
@@ -80,13 +89,16 @@ def is_healthy() -> bool:
 
 # ── 触发词映射表（借鉴A+B 共用）─────────────────────────────────────
 
+# v3 (2026-07-18): name -> skill_path 缓存，供 fast_path 命中后 read_file 用
+_SKILL_PATH_BY_NAME: dict[str, str] = {}
+
 def _build_trigger_mapping() -> None:
     """从 Chroma 全量元数据构建 {触发词/技能名 → skill_name} 映射表。
 
     调用时机：模块预热成功后一次；_TRIGGER_MAPPING 在 fast_path 和
     query 分类的单 token 查表中查询，不依赖实时检索结果。
     """
-    global _TRIGGER_MAPPING
+    global _TRIGGER_MAPPING, _SKILL_PATH_BY_NAME
     if not _healthy:
         return
     try:
@@ -94,12 +106,17 @@ def _build_trigger_mapping() -> None:
         # 拉取全部记录的 metadata（不含 embedding，轻量）
         all_data = collection.get(include=["metadatas"])
         mapping: dict[str, str] = {}
+        path_by_name: dict[str, str] = {}
         for meta in all_data.get("metadatas", []):
             if meta is None:
                 continue
             skill_name = meta.get("skill_name", "").strip().lower()
             if not skill_name:
                 continue
+            # 缓存 name -> skill_path（v3: fast_path 命中后也要能 read_file）
+            raw_path = meta.get("skill_path", "")
+            if raw_path:
+                path_by_name[skill_name] = raw_path
             # 技能名本身（最高优先级）
             mapping[skill_name] = skill_name
             # trigger_tags 中的别名/触发词
@@ -112,6 +129,7 @@ def _build_trigger_mapping() -> None:
             except (json.JSONDecodeError, TypeError):
                 pass
         _TRIGGER_MAPPING = mapping
+        _SKILL_PATH_BY_NAME = path_by_name
         logger.info("dcg: trigger mapping loaded (%d entries)", len(mapping))
     except Exception as exc:
         logger.warning("dcg: trigger mapping build failed: %s", exc)
@@ -145,7 +163,7 @@ def _classify_query(query: str) -> str:
     if q.lower() in _TRIGGER_MAPPING:
         return 'retrieval'
 
-    # 规则2：问候/元指令（覆盖“你好吗”“你好呀”等变体）
+    # 规则2：问候/元指令（覆盖"你好吗""你好呀"等变体）
     if re.search(r'^(你好|hi|hello|hey|谢谢|感谢|ok|好的|在吗|在不在)', q, re.I):
         return 'non_retrieval'
 
@@ -203,18 +221,134 @@ def _fast_path(query: str) -> list | None:
 
 
 def _build_fast_result(skill_name: str) -> dict:
-    """构造 fast path 返回条目（补齐 search() 返回格式的最小字段集）。"""
+    """构造 fast path 返回条目（补齐 search() 返回格式的最小字段集）。
+
+    v3 (2026-07-18): 必须携带 skill_path，否则"技能即知识"架构下
+    read_file 闭环在 fast_path 命中时断链（原实现只填 name/score/stage）。
+    """
     return {
         "skill_name": skill_name,
+        "skill_path": _SKILL_PATH_BY_NAME.get(skill_name.lower(), ""),
         "final_score": 1.0,
         "route_stage": "fast_path",
     }
 
 
-# ── 匹配 ─────────────────────────────────────────────────────────
+# ── v3 拆分（RISK-3）：search 子函数 ──────────────────────────────
 
-def search(query: str, top_k: int = 5) -> List[dict]:
-    """主入口：稠密→sparse→RRF→过滤→排序。
+def _dense_recall(query: str, collection) -> tuple:
+    """稠密召回：query → 云端向量 → Chroma top-K。
+
+    Returns:
+        (distances, metadatas, documents) — Chroma 原始返回。
+        任一为空则调用方应短路返回 []。
+    """
+    q_text = query if len(query) >= MIN_QUERY_LEN else QUERY_TEMPLATE_PROSE.format(query=query)
+    query_dense = get_cloud_dense([q_text])[0]
+    results = collection.query(
+        query_embeddings=[query_dense],
+        n_results=TOP_K_CANDIDATES,
+        include=["distances", "metadatas", "documents"],
+    )
+    if not results["ids"][0]:
+        return [], [], []
+    return results["distances"][0], results["metadatas"][0], results["documents"][0]
+
+
+def _compute_sparse_and_filter(query: str, distances: list, metadatas: list, documents: list) -> list:
+    """sparse 评分 + disable 过滤 + 基础候选构建。
+
+    对每个 dense 召回候选计算 sparse 分数，过滤 disable 标签命中的，
+    返回通过门禁的候选列表（已含 dense_score / sparse_score）。
+    """
+    candidates = []
+    for dense_rank, (dist, meta, doc) in enumerate(zip(distances, metadatas, documents), start=1):
+        dense_score = 1.0 - dist  # cosine 距离转相似度
+        tag_sparse = meta.get("tag_sparse", "{}")
+        sparse_score = calculate_sparse_score(query, tag_sparse)
+
+        disable = json.loads(meta.get("disable_tags", "[]"))
+        trigger = json.loads(meta.get("trigger_tags", "[]"))
+
+        # disable 精确匹配 + 短语级模糊（query 子串命中 disable tag）
+        disable_hit = query in disable or any(d in query for d in disable)
+
+        # trigger 精确命中加分
+        trigger_exact = query in trigger
+        trigger_phrase = any(t in query for t in trigger) if not trigger_exact else False
+
+        # v3: leading word 命中加分（与 sparse 分叠加，boost=0.010）
+        leading_raw = meta.get("leading", "")
+        leading_list = json.loads(leading_raw) if isinstance(leading_raw, str) and leading_raw.startswith("[") else []
+        leading_boost = 0.010 if any(lw.lower() in query.lower() for lw in leading_list) else 0.0
+
+        # 最终 sparse = 原始分 + trigger 命中 + leading boost
+        sparse_total = sparse_score + (0.005 if trigger_exact else (0.002 if trigger_phrase else 0)) + leading_boost
+
+        doc_text = doc if isinstance(doc, str) else (doc[0] if isinstance(doc, (list, tuple)) else doc)
+
+        candidates.append({
+            "skill_name": meta.get("skill_name", ""),
+            "skill_path": meta.get("skill_path", ""),
+            "dense_score": dense_score,
+            "dense_rank": dense_rank,
+            "sparse_score": sparse_total,
+            "trigger_exact": trigger_exact,
+            "disable_hit": disable_hit,
+            "route_stage": "",
+            "doc_preview": (doc_text or "")[:120],
+        })
+
+    # disable 过滤（精确 + 短语级）
+    valid = [c for c in candidates if not c.pop("disable_hit")]
+    return valid
+
+
+def _rrf_and_annotate(valid: list, query: str) -> list:
+    """RRF 融合 + route_stage 标注。
+
+    在 valid 候选上计算 sparse rank，RRF 融合 dense+sparse，
+    标注 route_stage（fast_path / rrf / dense），返回排序后列表。
+    """
+    if not valid:
+        return []
+
+    # sparse rank（降序）
+    valid_sorted_sparse = sorted(valid, key=lambda c: c["sparse_score"], reverse=True)
+    for sparse_rank, c in enumerate(valid_sorted_sparse, start=1):
+        c["sparse_rank"] = sparse_rank
+
+    # RRF 融合（trigger 命中加权：+0.010）
+    for c in valid:
+        trigger_bonus = 0.010 if c.get("trigger_exact") else 0.0
+        c["final_score"] = (
+            1.0 / (RRF_K + c["dense_rank"])
+            + 1.0 / (RRF_K + c["sparse_rank"])
+            + trigger_bonus
+        )
+
+    # 排序
+    valid.sort(key=lambda c: c["final_score"], reverse=True)
+
+    # route_stage 标注
+    if USE_ROUTE_ANNOTATION:
+        for c in valid:
+            if c["final_score"] >= 0.029:
+                c["route_stage"] = "fast_path"
+            elif c["trigger_exact"]:
+                c["route_stage"] = "rrf"
+            elif c["dense_rank"] <= 3:
+                c["route_stage"] = "dense"
+            else:
+                c["route_stage"] = "rrf"
+
+    return valid
+
+
+# ── 主入口 ────────────────────────────────────────────────────────
+
+def search(query: str, top_k: int = DEFAULT_TOP_K) -> List[dict]:
+    """主入口：分类→快速路径→稠密→sparse→RRF→过滤→排序。
 
     vdb 不可用时（chroma 损坏 / 未构建）返回空列表，不抛异常。
     """
@@ -230,103 +364,31 @@ def search(query: str, top_k: int = 5) -> List[dict]:
 
     collection = _get_collection()
 
-    # ---------- PATCH B: dcg-inspired — 白名单直达（在 dense 召回后、RRF 前） ----------
+    # ---------- PATCH B: dcg-inspired — 白名单直达 ----------
     if USE_FAST_PATH:
         fast_result = _fast_path(query)
         if fast_result is not None:
             return fast_result
 
-    # 1. query 稠密向量（v2.1: 短查询用 prose 模板包装，长查询裸送）
-    q_text = query if len(query) >= MIN_QUERY_LEN else QUERY_TEMPLATE_PROSE.format(query=query)
-    query_dense = get_cloud_dense([q_text])[0]
-
-    # 2. Chroma 召回 top-K
-    results = collection.query(
-        query_embeddings=[query_dense],
-        n_results=TOP_K_CANDIDATES,
-        include=["distances", "metadatas", "documents"],
-    )
-
-    if not results["ids"][0]:
+    # 1. 稠密召回
+    distances, metadatas, documents = _dense_recall(query, collection)
+    if not distances:
         return []
 
-    distances = results["distances"][0]
-    metadatas = results["metadatas"][0]
+    # 2. sparse 评分 + disable 过滤
+    valid = _compute_sparse_and_filter(query, distances, metadatas, documents)
 
-    # Chroma 返回按余弦距离升序（最近优先），迭代序号即 dense rank
-    candidates = []
-    for dense_rank, (dist, meta) in enumerate(zip(distances, metadatas), start=1):
-        dense_score = 1.0 - dist  # cosine 距离转相似度
-        tag_sparse = meta.get("tag_sparse", "{}")
-        sparse_score = calculate_sparse_score(query, tag_sparse)
+    # 3. RRF 融合 + route_stage 标注
+    annotated = _rrf_and_annotate(valid, query)
 
-        disable = json.loads(meta.get("disable_tags", "[]"))
-        trigger = json.loads(meta.get("trigger_tags", "[]"))
+    # 4. 路由门禁过滤
+    gated = [it for it in annotated if routing.is_query_allowed_for_skill(query, it["skill_name"])]
 
-        candidates.append({
-            "skill_name": meta["skill_name"],
-            "skill_path": meta["skill_path"],
-            "trigger_tags": trigger,
-            "disable_tags": disable,
-            "dense_rank": dense_rank,
-            "dense_score": round(dense_score, 4),
-            "sparse_score": round(sparse_score, 4),
-            # final_score 在 RRF 计算后填充
-        })
-
-    # 3. 过滤 disable（禁用标签匹配即排除）
-    # 兼容 DISABLE_TAG_POOL 下划线格式（cli_only→匹配"cli only"或"cli_only"）
-    query_lower = query.lower().replace("_", " ")
-    valid = []
-    for item in candidates:
-        hit = False
-        for d in item["disable_tags"]:
-            d_lower = d.lower().replace("_", " ")
-            # 支持: cli_only → "cli"+"only" 都出现在 query 中
-            parts = d_lower.split()
-            if len(parts) > 1 and all(p in query_lower for p in parts):
-                hit = True
-                break
-            # 或精确匹配
-            if d_lower in query_lower:
-                hit = True
-                break
-        if not hit:
-            valid.append(item)
-
-    if not valid:
-        return []
-
-    # 4. RRF 融合：按 sparse_score 降序赋予 sparse rank
-    # （dense_rank 已在 Chroma 结果中固化）
-    sparse_sorted = sorted(valid, key=lambda x: x["sparse_score"], reverse=True)
-    for i, item in enumerate(sparse_sorted, start=1):
-        item["sparse_rank"] = i
-
-    # 5. 计算 RRF final_score = 1/(k + dense_rank) + 1/(k + sparse_rank)
-    # 5+. trigger_tags 命中加分：query 含触发词则 +0.005（加法叠加，避免 dense 主导时 boost 无效）
-    TRIG_HIT_BONUS = 0.010
-    for item in valid:
-        sr = item["sparse_rank"]
-        dr = item["dense_rank"]
-        rrf_score = 1.0 / (RRF_K + dr) + 1.0 / (RRF_K + sr)
-        if any(t.lower() in query_lower for t in item["trigger_tags"]):
-            rrf_score += TRIG_HIT_BONUS
-        item["final_score"] = round(rrf_score, 4)
-
-    # 6. 按 final_score 排序
-    valid.sort(key=lambda x: x["final_score"], reverse=True)
-
-    # 7. 路由门禁过滤（进检索后、返回前）：基于原始 query 剔除无资格的重型技能。
-    #    仅影响 routing.get_gated_skills() 命中的技能，其余一律放行。
-    gated = [it for it in valid if routing.is_query_allowed_for_skill(query, it["skill_name"])]
-
-    # ---------- PATCH C: dcg-inspired — 路由阶段标记 ----------
-    if USE_ROUTE_ANNOTATION:
-        for it in gated:
-            it["route_stage"] = "rrf"
-
-    return gated[:top_k]
+    # 5. 返回 top_k（去掉内部辅助字段）
+    return [
+        {k: v for k, v in it.items() if k not in ("dense_rank", "sparse_rank", "trigger_exact", "doc_preview")}
+        for it in gated[:top_k]
+    ]
 
 
 # ── 冷启动预热（模块导入时初始化 Chroma）────────────────────────
