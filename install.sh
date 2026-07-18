@@ -4,7 +4,7 @@
 # 用法:
 #   bash install.sh                    自动检测新装/存量
 #   bash install.sh --force            强制全量覆盖（新装机）
-#   bash install.sh --dry              预览变更不执行
+#   bash install.sh --dry-run          预览变更不执行（别名 --dry）
 #   bash install.sh --profile <name>   安装到指定 profile（如 --profile work）
 #
 # ⚠ profile 安全:
@@ -31,9 +31,10 @@ PROFILE=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --force) FORCE=true ;;
-        --dry)   DRY=true ;;
-        --profile) PROFILE="${2:-}"; [ -n "$PROFILE" ] || { echo "--profile 需要参数"; exit 2; }; shift ;;
+        --dry|--dry-run)   DRY=true ;;
+        --profile) PROFILE="${2:-}"; [ -n "$PROFILE" ] || { echo "  [ERROR] --profile 需要参数"; exit 2; }; shift ;;
         --profile=*) PROFILE="${1#*=}" ;;
+        *) echo "  [ERROR] 未知参数: $1"; echo "  用法: bash install.sh [--force] [--dry|--dry-run] [--profile <name>]"; exit 2 ;;
     esac
     shift
 done
@@ -67,10 +68,20 @@ fi
 echo ""
 
 # ── 函数: 复制 ──────────────────────────────────────────────
+_DC_SOURCES=0 _DC_VDB=0 _DC_SCRIPTS=0 _DC_SKILLS=0 _DC_ENV=0 _DC_OTHER=0
 do_cp() {
     local src="$1" dst="$2" label="$3"
     if [ "$DRY" = true ]; then
-        echo "  [DRY] cp -r $src $dst  ← $label"
+        echo "  [DRY] $label  →  $(basename "$dst")"
+        # 按前缀分类计数
+        case "$label" in
+            SOUL.md|memories/*) _DC_SOURCES=$((_DC_SOURCES + 1)) ;;
+            vdb/*) _DC_VDB=$((_DC_VDB + 1)) ;;
+            scripts/*) _DC_SCRIPTS=$((_DC_SCRIPTS + 1)) ;;
+            skills/*) _DC_SKILLS=$((_DC_SKILLS + 1)) ;;
+            .env*|.gitignore) _DC_ENV=$((_DC_ENV + 1)) ;;
+            *) _DC_OTHER=$((_DC_OTHER + 1)) ;;
+        esac
         return
     fi
     mkdir -p "$(dirname "$dst")"
@@ -141,10 +152,19 @@ fi
 # ── 完成 ────────────────────────────────────────────────────
 echo ""
 echo "=========================================="
-echo " 安装完成"
 if [ "$DRY" = true ]; then
-    echo " （DRY 模式 — 未实际写入）"
+    echo " DRY-RUN 预览 — 以下操作将被执行:"
+    echo ""
+    printf "  %-20s %4s\n" "核心元数据" "$_DC_SOURCES"
+    printf "  %-20s %4s\n" "检索工具链" "$_DC_VDB"
+    printf "  %-20s %4s\n" "脚本" "$_DC_SCRIPTS"
+    printf "  %-20s %4s\n" "技能集" "$_DC_SKILLS"
+    printf "  %-20s %4s\n" "环境/忽略" "$_DC_ENV"
+    [ "$_DC_OTHER" -gt 0 ] && printf "  %-20s %4s\n" "其他" "$_DC_OTHER"
+    echo ""
+    echo "  ⚠️ 未实际写入。去掉 --dry-run 执行。"
 else
+    echo " 安装完成"
     echo " 下一步:"
     echo "   cd ~/.hermes/vdb && bash init-vdb.sh   # 构建检索索引"
     echo "   hermes mcp list                        # 验证 MCP 接入"
