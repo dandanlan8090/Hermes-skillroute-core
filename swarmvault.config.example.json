@@ -1,0 +1,44 @@
+{
+  "workspace": {
+    "rawDir": "raw",
+    "wikiDir": "wiki",
+    "stateDir": "state",
+    "agentDir": "agent",
+    "inboxDir": "inbox"
+  },
+  "providers": {
+    "local": {
+      "type": "heuristic",
+      "model": "heuristic-v1",
+      "capabilities": ["chat", "structured", "vision", "local"]
+    },
+    "agnes": {
+      "type": "openai",
+      "baseUrl": "https://apihub.agnes-ai.com/v1",
+      "apiKeyEnv": "AGNES_API_KEY",
+      "model": "agnes-2.0-flash",
+      "capabilities": ["chat", "structured"]
+    },
+    "siliconflow": {
+      "type": "openai",
+      "baseUrl": "https://api.siliconflow.cn/v1",
+      "apiKeyEnv": "SILICONFLOW_API_KEY",
+      "model": "BAAI/bge-m3",
+      "capabilities": ["embeddings"]
+    }
+  },
+  "tasks": {
+    "compileProvider": "agnes",
+    "queryProvider": "local",
+    "lintProvider": "local",
+    "visionProvider": "local",
+    "imageProvider": "local"
+  },
+  "retrieval": {
+    "backend": "sqlite",
+    "shardSize": 25000,
+    "hybrid": true,
+    "rerank": false,
+    "embeddingProvider": "siliconflow"
+  }
+}

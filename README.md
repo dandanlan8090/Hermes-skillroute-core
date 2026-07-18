@@ -1,5 +1,7 @@
 # README — Hermes-skillroute-core
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Hermes Agent 微内核架构的配置模板仓库。包含极致拆解后的 `SOUL.md`、按分类组织的技能集和 `vdb` 检索工具链。
 
 > ⚠️ 本仓库**只含元数据资产与源码**，不含任何个人路径、token、hostname 或私人模型名。部署时由 `install.sh` 在用户本地生成运行时状态（向量索引、`.venv`、`.env`）。
